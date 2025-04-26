@@ -1,5 +1,5 @@
 # HoneyPipe
-## 🍯 HoneyPipe — the “sweet & simple” dict-pipeline micro-framework  
+## 🍯 HoneyPipe — the “sweet & simple” key-value-pipeline micro-framework  
 
 Send your data along a chain of tiny *steps* that *bzzz* and let each function
 add its own drop of nectar.  
