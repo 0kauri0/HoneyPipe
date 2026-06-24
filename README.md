@@ -1,167 +1,255 @@
-# HoneyPipe
-## 🍯 HoneyPipe — the “sweet & simple” key-value-pipeline micro-framework  
+# Honeypipe
 
-Send your data along a chain of tiny *steps* that *bzzz* and let each function
-add its own drop of nectar.  
-With just one operator `>>` you can mutate a shared dict in-place, mix sync
-and async code, and orchestrate whole *hives* without boiler-plate.
+A tiny **actor-based async runtime** for Python. Each *pipe* is an independent
+actor with its own message queue and handler map; pipes form a parent/child tree
+and communicate by passing plain `dict` messages. The whole core is ~130 lines.
 
-```
-dict_source  >>  step1  >>  step2  >>  step3
-```
-
-• **Honey** = the key/value payload you care about.  
-• **Pipe**   = the right-shift chain that carries it.  
-• **Bees**   = your individual functions / methods working in parallel hives.
+- **Actor model** — one queue per pipe, one coroutine draining it, one handler per message type.
+- **Dict-as-protocol** — pipes and messages are plain dicts (a `Pipe` `TypedDict` documents the shape).
+- **Hierarchical** — pipes spawn sub-pipes; messages route up to `parent`, down to a named sub-pipe, or to `self`.
+- **Runtime-pluggable** — add/remove handlers and spawn sub-pipes while running.
+- **HTTP proxy** — an optional FastAPI server bridges remote clients to the pipe tree.
 
 ---
 
-### 0. 30-second mental model  
+## Install
 
-```
-┌─────────┐        >>      ┌─────────────┐   >>   ┌─────────────┐
-│  dict   │ ────▶ 🐝 step │  🐝 step    │ ───▶  │   🐝 step   │
-└─────────┘                 (adds nectar)         (adds nectar …)
-```
+Requires **Python 3.11+** (uses `asyncio.Queue`, `TypedDict`, `X | Y` typing).
 
-* A **Step** is “a callable that accepts a dict, mutates it, returns the *same* dict”.  
-* `data >> step1 >> step2` works because `Step.__rrshift__` and `Step.__rshift__`
-  handle the plumbing for you.  
-* Decorators `conditional_proc` / `conditional_func` (and, if you need raw
-  control, `_condition`) transform regular Python callables into these Step
-  objects—instantly chainable, no wrappers to write.
+```bash
+# core runtime has no third-party deps.
+# the HTTP server and tests need:
+pip install fastapi httpx pytest pytest-asyncio
+```
 
 ---
 
-### 1.  The four drops of nectar you’ll use most  
+## Concepts
 
-| # | Name | Decorates | Returns | Use case |
-|---|------|-----------|---------|----------|
-|1|`_condition(pred)`|sync/async **function(d)**|plain callable|quick yes/no gate, manual call or `Step(...)` wrap|
-|2|`conditional_proc(pred)`|sync/async **procedure(d)**|`Step`|in-place mutation, perfect for business logic|
-|3|`conditional_func(pred, store_return_as="key")`|sync/async **func(x,y, …)**|`Step`|pulls args from dict, stores computed honey back|
-|4|`Step`|n/a|n/a|glues everything together with `>>`|
+### A pipe
 
-
----
-
-### 2.  End-to-end demo (`demo.py`)  
+A pipe is a dict produced by `create_pipe(...)`:
 
 ```python
-import asyncio, random
-from honeypipe import Step, _condition, conditional_proc, conditional_func
+{
+    "data":      {"id": "...", ...},   # arbitrary per-pipe state (must carry an "id")
+    "parent":    {"id": ..., "queue": <asyncio.Queue>},  # or {} for a root
+    "queue":     <asyncio.Queue>,      # this pipe's inbox
+    "sub_pipes": [{"id": ..., "queue": ...}, ...],       # registered children
+    "handlers":  {"<type>": <async fn(pipe, msg)>, ...}, # dispatch table
+}
+```
 
-# ───────────────────── 1) plain function → Step via conditional_proc
-@conditional_proc(lambda d: "x" not in d)   # fires once
-def add_x(d): d["x"] = 1
+The shape is captured by `core.Pipe` (a `TypedDict`, `total=False`) — zero runtime
+cost, just documentation + editor hints.
 
-# ───────────────────── 2) async function → Step via conditional_proc
-@conditional_proc(lambda d: d.get("want_async"))
-async def async_double_a(d):
-    await asyncio.sleep(0.05)
-    d["a"] *= 2
+### A message
 
-# ───────────────────── 3) value-producing func → Step via conditional_func
-@conditional_func(lambda d: d["b"] > 0, store_return_as="hyp")
-def hyp(a: int, b: int):                   # pulls a & b from *dict*!
-    return (a*a + b*b) ** 0.5
+A message is any dict with a `"type"` key. The runtime adds `"id"` and `"src"`
+on send. Example: `{"type": "greet", "name": "ada"}`.
 
-# ───────────────────── 4) method steps inside a custom dict subclass
-class Data(dict):
-    @staticmethod
-    @conditional_proc(lambda d: True)
-    def tag(d): d["tagged"] = True
+### The loop
 
-    @staticmethod
-    @conditional_func(store_return_as="half")
-    def half(a): return a / 2
+`run_pipe(pipe)` is the actor loop:
 
-# ───────────────────── 5) optional “verbose” printer via _condition + Step
-@_condition(lambda d: d.get("verbose"))
-def debug_printer(d): print("STATE:", d)
+```
+while not pipe["data"]["_shutdown"]:
+    msg = await pipe["queue"].get()
+    await dispatch(pipe, msg)      # validates "type", finds handler, runs it
+```
 
-Debug = Step(debug_printer)    # wrap manually ⇒ chainable
+`dispatch` validates input at the queue boundary: a message with no `type`, or an
+unknown `type`, is routed to the `_error` handler instead of crashing the loop.
+Exceptions raised inside a handler are also caught and funneled to `_error`.
 
-# ───────────────────── 6) generator that yields dicts  (“sources”)
-def gen():
-    for i in range(3):
-        yield Data(a=i, b=i+1, want_async=bool(i % 2), verbose=True)
+---
 
-# ───────────────────── 7) build a *composite* pipeline once
-PIPE = add_x >> async_double_a >> hyp >> Data.tag >> Data.half >> Debug
+## Quick start
 
-# ───────────────────── 8) run!
+```python
+import asyncio
+from core import create_pipe, send, run_pipe
+
 async def main():
-    for d in gen():           # any dict-like “source”
-        await (d >> PIPE)     # leftmost await handles async links
-        print("FINAL ⇒", {k: d[k] for k in sorted(d)})
+    # a handler is just: async def (pipe, msg)
+    async def greet(pipe, msg):
+        print(f"hello {msg['name']} (from {msg['src']})")
+
+    pipe = create_pipe(data={"id": "p1"}, handlers={"greet": greet})
+
+    # run the loop in the background
+    loop = asyncio.create_task(run_pipe(pipe))
+
+    await send(pipe, {"type": "greet", "name": "ada"})   # -> "self" by default
+    await asyncio.sleep(0.05)
+
+    await send(pipe, {"type": "_shutdown"})               # stop the loop
+    await loop
 
 asyncio.run(main())
 ```
 
-Example output
+---
+
+## Core API (`core.py`)
+
+### `create_pipe(data=None, parent=None, handlers=None, init_seq=None) -> Pipe`
+Builds a pipe. Always installs the built-in handlers (below); your `handlers`
+are merged on top (and may override built-ins). `init_seq` is a list of messages
+pre-loaded onto the queue before the loop starts.
+
+### `async send(pipe, msg, dst=None)`
+Delivers `msg` to a target queue. **Does not mutate the caller's dict** — it sends
+a copy with `id` and `src` injected, so you can safely reuse a payload.
+
+| `dst` | Target |
+|---|---|
+| `None` / `"self"` | this pipe's own queue |
+| `"parent"` | `pipe["parent"]["queue"]` (raises `RuntimeError` if no parent) |
+| `"<sub-id>"` | the matching entry in `pipe["sub_pipes"]` (raises `ValueError` if not found) |
+
+### `async dispatch(pipe, msg)`
+Validates `msg["type"]`, looks up the handler, runs it. Routes missing-type,
+unknown-type, and handler exceptions to `_error`.
+
+### `async run_pipe(pipe)`
+The actor loop. Runs until `pipe["data"]["_shutdown"]` is truthy.
+
+### Built-in handlers
+These are registered on every pipe and invoked by message `type`:
+
+| `type` | Message fields | Effect |
+|---|---|---|
+| `add_handler` | `name`, `fn` | register/replace a handler at runtime |
+| `del_handler` | `name` | remove a handler (no-op if absent) |
+| `route` | `pipe_id`, `msg` | forward `msg` to sub-pipe `pipe_id` (no-op if `pipe_id` falsy) |
+| `run_subpipe` | `data`, `handlers?`, `init_seq?` | spawn a child pipe and register it |
+| `_shutdown` | — | set the shutdown flag and cascade `_shutdown` to all sub-pipes |
+| `_error` | `error` \| `exception`, `original_msg?` | build/forward the canonical error envelope |
+
+**Error envelope.** `_error` is both producer and consumer of one canonical shape:
+
+```python
+{"pipe_id": <originating pipe id>, "message": <str>, "original": <the msg that failed>}
 ```
-STATE: {'a': 0, 'b': 1, 'half': 0.0, 'hyp': 1.0, 'tagged': True, 'x': 1, 'verbose': True, 'want_async': False}
-FINAL ⇒ {'a': 0, 'b': 1, 'half': 0.0, 'hyp': 1.0, 'tagged': True, 'verbose': True, 'want_async': False, 'x': 1}
-STATE: {'a': 2, 'b': 2, 'half': 1.0, 'hyp': 2.8284271247461903, 'tagged': True, 'x': 1, 'verbose': True, 'want_async': True}
-FINAL ⇒ {'a': 2, 'b': 2, 'half': 1.0, 'hyp': 2.8284271247461903, 'tagged': True, 'verbose': True, 'want_async': True, 'x': 1}
-STATE: {'a': 2, 'b': 3, 'half': 1.5, 'hyp': 3.605551275463989, 'tagged': True, 'x': 1, 'verbose': True, 'want_async': False}
-FINAL ⇒ {'a': 2, 'b': 3, 'half': 1.5, 'hyp': 3.605551275463989, 'tagged': True, 'verbose': True, 'want_async': False, 'x': 1}
+
+A raw cause (string/exception) is wrapped into this shape; an already-structured
+envelope is passed through unchanged. Errors bubble **up** to the parent; at a
+root (no parent) an error triggers `_shutdown`. `pipe_id` preserves the *origin*
+across hops, which is what you want for debugging.
+
+---
+
+## Hierarchy
+
+```python
+# spawn a child by sending run_subpipe to a running parent
+await send(parent, {
+    "type": "run_subpipe",
+    "data": {"id": "worker"},
+    "handlers": {"work": work_handler},
+})
+
+# then route messages down to it
+await send(parent, {"type": "route", "pipe_id": "worker",
+                    "msg": {"type": "work", "payload": 42}})
+```
+
+- `send(child, msg, dst="parent")` sends **up**.
+- `send(parent, msg, dst="<child-id>")` (or a `route` message) sends **down**.
+- `_shutdown` cascades through the whole subtree.
+
+If `run_subpipe` is sent without `data` / without an `"id"`, the child registers
+with `id=None` and still spawns — a missing id degrades gracefully rather than
+crashing the parent.
+
+---
+
+## Utilities (`utils.py`)
+
+| Function | Purpose |
+|---|---|
+| `load_handler_from_file(src_path, func_name)` | import a handler from a `.py` file; sync functions are auto-wrapped as async |
+| `create_pipe_from_spec(spec, extra_data=None, *, parent_pipe=None)` | build a pipe from a declarative dict spec (handlers given as `{"src", "f_name"}`) |
+| `async schedule(pipe, msg)` | fire-and-forget delayed send: `{"delay": <s>, "msg": {...}, "dst": ...}` |
+| `async dispatch_debug(pipe, msg)` / `run_pipe_debug(pipe)` | drop-in debug variants that log type, timing, and whether `data` changed |
+
+**Spec example:**
+
+```python
+spec = {
+    "data": {"id": "p"},
+    "handlers": {"work": {"src": "handlers/work.py", "f_name": "work"}},
+    "init_seq": [{"type": "work"}],
+}
+pipe = create_pipe_from_spec(spec, extra_data={"role": "worker"})
 ```
 
 ---
 
-### 3.  Micro-recipes  
+## HTTP server (`server.py`)
 
-#### 3.1  Turn an existing `_condition`-decorated function into a chainable step  
+A FastAPI app that proxies remote clients into the pipe tree. A root pipe runs
+for the app lifetime; each `remote_id` gets a lazily-created **proxy pipe** under
+the root, with an idle timeout.
 
-```python
-@_condition(lambda d: d.get("mode") == "debug")
-def log(d): print(d)
-
-LogStep = Step(log)
-data >> LogStep >> other_step
+```bash
+uvicorn server:app
 ```
 
-#### 3.2  Compose a “mega” loop step  
+### `POST /pipe/{remote_id}`
 
-```python
-@conditional_proc(lambda d: d["next"] != "exit")
-def agent_cycle(d):
-    while d["next"] != "exit":
-        d["tick"] = d.get("tick", 0) + 1
-        if d["tick"] > 3: d["next"] = "exit"
+Body is a JSON message.
 
-data >> agent_cycle >> after_cycle
+- **`{"type": "ping"}`** → drains one queued outbound message:
+  `{"msg": {...}}` or `{"msg": null}` if none.
+- **any other message** → forwarded up toward the root; returns `{"status": "ok"}`.
+- Optional **`"_timeout"`** (seconds) overrides the idle cleanup window
+  (`DEFAULT_TIMEOUT = 30`). Each request resets the timer; once it elapses the
+  proxy is shut down and de-registered.
+
+Proxy creation is guarded by an `asyncio.Lock`, so concurrent first-requests for
+the same `remote_id` create exactly one proxy (no TOCTOU race).
+
+> Scope note: the proxy registry is in-memory with no auth/persistence — suitable
+> for prototypes and low-throughput use, not as-is for production.
+
+---
+
+## Testing
+
+```bash
+cd project
+pytest -q                          # 45 tests
+pytest --cov=. --cov-report=term   # 100% on core / server / utils
 ```
 
-#### 3.3  Attach steps from different files to one class  
+The suite covers happy paths **and** boundaries: missing/unknown message types,
+nonexistent parent/sub-pipe targets, handler exceptions, error propagation across
+hops, no-op edges, the sync-handler wrapper, concurrent same-remote requests, and
+proxy idle cleanup.
 
-```python
-# file a.py
-from honeypipe import conditional_proc, Step
-from domain import Actor             # same class everywhere
+---
 
-@staticmethod
-@conditional_proc(lambda d: True)
-def preprocess(d): d["p"] = 1
+## Project layout
 
-Actor.preprocess = preprocess        # plug-in
-
-# file main.py
-data >> Actor.preprocess >> Actor.other_step
+```
+core.py     # runtime: pipes, send, dispatch, run_pipe, built-in handlers
+utils.py    # dynamic handler loading, spec factory, schedule, debug loop
+server.py   # FastAPI HTTP proxy over the pipe tree
+test_*.py   # pytest suite (asyncio mode)
+AUDIT.md    # code-quality / coverage audit
 ```
 
 ---
 
-### 4.  Cheat-sheet  
+## Design notes & limitations
 
-```
-def f(d): ...              # plain             ──► Step(f) if you need >>
-@_condition(pred)          # gated call        ──► Step(...) if you need >>
-@conditional_proc(pred)    # gated *procedure* ──► ready for >>
-@conditional_func(pred, store_return_as="k")
-                           # gated *function*  ──► ready for >>
-```
-
-All three roads end in a Step object; once you have one, you can snap it into the `>>` pipeline like a hex-cell in a honeycomb.
+- **Dicts over classes.** At this size, dict-as-protocol keeps the runtime tiny
+  and inspectable; the `Pipe` `TypedDict` documents the shape without inflating it.
+- **Cancellation propagates.** `dispatch` only catches `Exception`; `CancelledError`
+  / `KeyboardInterrupt` exit the loop as intended.
+- **Unbounded queues.** `asyncio.Queue()` has no `maxsize` — fine for normal use,
+  but there's no backpressure under sustained overload.
+- **Send ownership.** After `send`, treat the message as consumed (fire-and-forget);
+  the caller's original dict is left untouched.
