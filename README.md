@@ -216,29 +216,14 @@ the same `remote_id` create exactly one proxy (no TOCTOU race).
 
 ---
 
-## Testing
-
-```bash
-cd project
-pytest -q                          # 45 tests
-pytest --cov=. --cov-report=term   # 100% on core / server / utils
-```
-
-The suite covers happy paths **and** boundaries: missing/unknown message types,
-nonexistent parent/sub-pipe targets, handler exceptions, error propagation across
-hops, no-op edges, the sync-handler wrapper, concurrent same-remote requests, and
-proxy idle cleanup.
-
----
-
 ## Project layout
 
 ```
 core.py     # runtime: pipes, send, dispatch, run_pipe, built-in handlers
 utils.py    # dynamic handler loading, spec factory, schedule, debug loop
 server.py   # FastAPI HTTP proxy over the pipe tree
-test_*.py   # pytest suite (asyncio mode)
-AUDIT.md    # code-quality / coverage audit
+template.py # Example
+README.md   # doc
 ```
 
 ---
